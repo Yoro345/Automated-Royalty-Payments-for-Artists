@@ -237,6 +237,76 @@
   )
 )
 
+(define-private (process-single-payment (artist-id uint) (stream-id uint) (undistributed uint) (current-block uint))
+  (match (get-artist artist-id)
+    artist
+    (match (get-stream-artist-percentage stream-id artist-id)
+      percentage-entry
+      (let
+        (
+          (payment-amount (unwrap! (calculate-artist-payment stream-id artist-id undistributed) err-not-found))
+          (payment-id (var-get next-payment-id))
+        )
+        (if (and (> payment-amount u0) (get is-active artist))
+          (begin
+            (try! (as-contract (stx-transfer? payment-amount tx-sender (get owner artist))))
+            (map-set artists
+              { artist-id: artist-id }
+              (merge artist { total-earned: (+ (get total-earned artist) payment-amount) })
+            )
+            (map-set payment-history
+              { payment-id: payment-id }
+              {
+                artist-id: artist-id,
+                stream-id: stream-id,
+                amount: payment-amount,
+                timestamp: current-block,
+                tx-sender: tx-sender
+              }
+            )
+            (var-set next-payment-id (+ payment-id u1))
+            (ok payment-amount)
+          )
+          (ok u0)
+        )
+      )
+      (ok u0)
+    )
+    (ok u0)
+  )
+)
+
+(define-public (distribute-batch-royalties (stream-id uint) (artist-ids (list 20 uint)))
+  (let
+    (
+      (stream (unwrap! (get-revenue-stream stream-id) err-not-found))
+      (undistributed (- (get total-revenue stream) (get distributed stream)))
+      (current-block stacks-block-height)
+      (final-state (fold process-batch-fold artist-ids { stream-id: stream-id, undistributed: undistributed, total-paid: u0, current-block: current-block }))
+      (total-distributed (get total-paid final-state))
+    )
+    (asserts! (> undistributed u0) err-invalid-amount)
+    (asserts! (get is-active stream) err-not-found)
+    (asserts! (is-eq tx-sender (get created-by stream)) err-unauthorized)
+    
+    (map-set revenue-streams
+      { stream-id: stream-id }
+      (merge stream { distributed: (+ (get distributed stream) total-distributed) })
+    )
+    (ok total-distributed)
+  )
+)
+
+(define-private (process-batch-fold (artist-id uint) (state { stream-id: uint, undistributed: uint, total-paid: uint, current-block: uint }))
+  (let
+    (
+      (payment-result (process-single-payment artist-id (get stream-id state) (get undistributed state) (get current-block state)))
+      (payment-amount (if (is-ok payment-result) (unwrap-panic payment-result) u0))
+    )
+    (merge state { total-paid: (+ (get total-paid state) payment-amount) })
+  )
+)
+
 (define-public (update-artist-status (artist-id uint) (is-active bool))
   (let
     (
