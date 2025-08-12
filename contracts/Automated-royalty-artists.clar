@@ -6,10 +6,15 @@
 (define-constant err-insufficient-funds (err u104))
 (define-constant err-unauthorized (err u105))
 (define-constant err-invalid-amount (err u106))
+(define-constant err-advance-not-found (err u107))
+(define-constant err-advance-already-approved (err u108))
+(define-constant err-advance-not-approved (err u109))
+(define-constant err-insufficient-collateral (err u110))
 
 (define-data-var next-artist-id uint u1)
 (define-data-var next-payment-id uint u1)
 (define-data-var contract-fee-percentage uint u250)
+(define-data-var next-advance-id uint u1)
 
 (define-map artists
   { artist-id: uint }
@@ -53,6 +58,21 @@
     amount: uint,
     timestamp: uint,
     tx-sender: principal
+  }
+)
+
+(define-map advances
+  { advance-id: uint }
+  {
+    artist-id: uint,
+    amount: uint,
+    repaid: uint,
+    interest-rate: uint,
+    due-date: uint,
+    is-approved: bool,
+    is-repaid: bool,
+    lender: principal,
+    created-at: uint
   }
 )
 
@@ -375,5 +395,108 @@
 
 (define-read-only (get-next-payment-id)
   (var-get next-payment-id)
+)
+
+(define-read-only (get-advance (advance-id uint))
+  (map-get? advances { advance-id: advance-id })
+)
+
+(define-read-only (calculate-advance-total (advance-id uint))
+  (match (get-advance advance-id)
+    advance
+    (let
+      (
+        (principal-amount (get amount advance))
+        (interest-amount (/ (* principal-amount (get interest-rate advance)) u10000))
+      )
+      (ok (+ principal-amount interest-amount))
+    )
+    err-advance-not-found
+  )
+)
+
+(define-public (request-advance (amount uint) (interest-rate uint) (duration-blocks uint))
+  (let
+    (
+      (artist-lookup (unwrap! (map-get? artist-by-principal { owner: tx-sender }) err-not-found))
+      (artist-id (get artist-id artist-lookup))
+      (artist-info (unwrap! (get-artist artist-id) err-not-found))
+      (advance-id (var-get next-advance-id))
+      (current-block stacks-block-height)
+      (due-date (+ current-block duration-blocks))
+    )
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (<= interest-rate u5000) err-invalid-percentage)
+    (asserts! (> duration-blocks u0) err-invalid-amount)
+    (asserts! (get is-active artist-info) err-unauthorized)
+    
+    (map-set advances
+      { advance-id: advance-id }
+      {
+        artist-id: artist-id,
+        amount: amount,
+        repaid: u0,
+        interest-rate: interest-rate,
+        due-date: due-date,
+        is-approved: false,
+        is-repaid: false,
+        lender: tx-sender,
+        created-at: current-block
+      }
+    )
+    
+    (var-set next-advance-id (+ advance-id u1))
+    (ok advance-id)
+  )
+)
+
+(define-public (approve-advance (advance-id uint))
+  (let
+    (
+      (advance (unwrap! (get-advance advance-id) err-advance-not-found))
+      (artist (unwrap! (get-artist (get artist-id advance)) err-not-found))
+    )
+    (asserts! (not (get is-approved advance)) err-advance-already-approved)
+    (asserts! (>= (stx-get-balance tx-sender) (get amount advance)) err-insufficient-funds)
+    (asserts! (get is-active artist) err-unauthorized)
+    
+    (try! (stx-transfer? (get amount advance) tx-sender (get owner artist)))
+    
+    (map-set advances
+      { advance-id: advance-id }
+      (merge advance { is-approved: true, lender: tx-sender })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (repay-advance (advance-id uint) (amount uint))
+  (let
+    (
+      (advance (unwrap! (get-advance advance-id) err-advance-not-found))
+      (artist (unwrap! (get-artist (get artist-id advance)) err-not-found))
+      (total-owed (unwrap! (calculate-advance-total advance-id) err-advance-not-found))
+      (already-repaid (get repaid advance))
+      (remaining-debt (- total-owed already-repaid))
+      (payment-amount (if (<= amount remaining-debt) amount remaining-debt))
+      (new-repaid (+ already-repaid payment-amount))
+      (is-fully-repaid (>= new-repaid total-owed))
+    )
+    (asserts! (get is-approved advance) err-advance-not-approved)
+    (asserts! (not (get is-repaid advance)) err-advance-not-found)
+    (asserts! (is-eq tx-sender (get owner artist)) err-unauthorized)
+    (asserts! (> payment-amount u0) err-invalid-amount)
+    (asserts! (>= (stx-get-balance tx-sender) payment-amount) err-insufficient-funds)
+    
+    (try! (stx-transfer? payment-amount tx-sender (get lender advance)))
+    
+    (map-set advances
+      { advance-id: advance-id }
+      (merge advance { repaid: new-repaid, is-repaid: is-fully-repaid })
+    )
+    
+    (ok payment-amount)
+  )
 )
 
