@@ -10,11 +10,18 @@
 (define-constant err-advance-already-approved (err u108))
 (define-constant err-advance-not-approved (err u109))
 (define-constant err-insufficient-collateral (err u110))
+(define-constant err-escrow-not-found (err u111))
+(define-constant err-milestone-not-found (err u112))
+(define-constant err-escrow-expired (err u113))
+(define-constant err-escrow-completed (err u114))
+(define-constant err-milestone-already-completed (err u115))
 
 (define-data-var next-artist-id uint u1)
 (define-data-var next-payment-id uint u1)
 (define-data-var contract-fee-percentage uint u250)
 (define-data-var next-advance-id uint u1)
+(define-data-var next-escrow-id uint u1)
+(define-data-var next-milestone-id uint u1)
 
 (define-map artists
   { artist-id: uint }
@@ -73,6 +80,33 @@
     is-repaid: bool,
     lender: principal,
     created-at: uint
+  }
+)
+
+(define-map escrows
+  { escrow-id: uint }
+  {
+    client: principal,
+    artist-id: uint,
+    total-amount: uint,
+    released-amount: uint,
+    project-name: (string-ascii 100),
+    expiry-block: uint,
+    is-completed: bool,
+    created-at: uint
+  }
+)
+
+(define-map milestones
+  { milestone-id: uint }
+  {
+    escrow-id: uint,
+    description: (string-ascii 200),
+    amount: uint,
+    is-completed: bool,
+    is-approved: bool,
+    submission-block: uint,
+    approval-block: uint
   }
 )
 
@@ -401,6 +435,22 @@
   (map-get? advances { advance-id: advance-id })
 )
 
+(define-read-only (get-escrow (escrow-id uint))
+  (map-get? escrows { escrow-id: escrow-id })
+)
+
+(define-read-only (get-milestone (milestone-id uint))
+  (map-get? milestones { milestone-id: milestone-id })
+)
+
+(define-read-only (get-next-escrow-id)
+  (var-get next-escrow-id)
+)
+
+(define-read-only (get-next-milestone-id)
+  (var-get next-milestone-id)
+)
+
 (define-read-only (calculate-advance-total (advance-id uint))
   (match (get-advance advance-id)
     advance
@@ -497,6 +547,155 @@
     )
     
     (ok payment-amount)
+  )
+)
+
+(define-public (create-escrow (artist-id uint) (total-amount uint) (project-name (string-ascii 100)) (duration-blocks uint))
+  (let
+    (
+      (artist (unwrap! (get-artist artist-id) err-not-found))
+      (escrow-id (var-get next-escrow-id))
+      (current-block stacks-block-height)
+      (expiry-block (+ current-block duration-blocks))
+    )
+    (asserts! (> total-amount u0) err-invalid-amount)
+    (asserts! (> duration-blocks u0) err-invalid-amount)
+    (asserts! (get is-active artist) err-unauthorized)
+    (asserts! (>= (stx-get-balance tx-sender) total-amount) err-insufficient-funds)
+    
+    (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set escrows
+      { escrow-id: escrow-id }
+      {
+        client: tx-sender,
+        artist-id: artist-id,
+        total-amount: total-amount,
+        released-amount: u0,
+        project-name: project-name,
+        expiry-block: expiry-block,
+        is-completed: false,
+        created-at: current-block
+      }
+    )
+    
+    (var-set next-escrow-id (+ escrow-id u1))
+    (ok escrow-id)
+  )
+)
+
+(define-public (create-milestone (escrow-id uint) (description (string-ascii 200)) (amount uint))
+  (let
+    (
+      (escrow (unwrap! (get-escrow escrow-id) err-escrow-not-found))
+      (milestone-id (var-get next-milestone-id))
+    )
+    (asserts! (is-eq tx-sender (get client escrow)) err-unauthorized)
+    (asserts! (not (get is-completed escrow)) err-escrow-completed)
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (<= (+ (get released-amount escrow) amount) (get total-amount escrow)) err-invalid-amount)
+    
+    (map-set milestones
+      { milestone-id: milestone-id }
+      {
+        escrow-id: escrow-id,
+        description: description,
+        amount: amount,
+        is-completed: false,
+        is-approved: false,
+        submission-block: u0,
+        approval-block: u0
+      }
+    )
+    
+    (var-set next-milestone-id (+ milestone-id u1))
+    (ok milestone-id)
+  )
+)
+
+(define-public (submit-milestone (milestone-id uint))
+  (let
+    (
+      (milestone (unwrap! (get-milestone milestone-id) err-milestone-not-found))
+      (escrow (unwrap! (get-escrow (get escrow-id milestone)) err-escrow-not-found))
+      (artist (unwrap! (get-artist (get artist-id escrow)) err-not-found))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get owner artist)) err-unauthorized)
+    (asserts! (not (get is-completed milestone)) err-milestone-already-completed)
+    (asserts! (not (get is-completed escrow)) err-escrow-completed)
+    (asserts! (< current-block (get expiry-block escrow)) err-escrow-expired)
+    
+    (map-set milestones
+      { milestone-id: milestone-id }
+      (merge milestone { is-completed: true, submission-block: current-block })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (approve-milestone (milestone-id uint))
+  (let
+    (
+      (milestone (unwrap! (get-milestone milestone-id) err-milestone-not-found))
+      (escrow (unwrap! (get-escrow (get escrow-id milestone)) err-escrow-not-found))
+      (artist (unwrap! (get-artist (get artist-id escrow)) err-not-found))
+      (current-block stacks-block-height)
+      (payment-amount (get amount milestone))
+      (contract-fee (/ (* payment-amount (var-get contract-fee-percentage)) u10000))
+      (artist-payment (- payment-amount contract-fee))
+    )
+    (asserts! (is-eq tx-sender (get client escrow)) err-unauthorized)
+    (asserts! (get is-completed milestone) err-not-found)
+    (asserts! (not (get is-approved milestone)) err-milestone-already-completed)
+    (asserts! (not (get is-completed escrow)) err-escrow-completed)
+    (asserts! (<= (+ (get released-amount escrow) payment-amount) (get total-amount escrow)) err-insufficient-funds)
+    
+    (try! (as-contract (stx-transfer? artist-payment tx-sender (get owner artist))))
+    
+    (map-set milestones
+      { milestone-id: milestone-id }
+      (merge milestone { is-approved: true, approval-block: current-block })
+    )
+    
+    (map-set escrows
+      { escrow-id: (get escrow-id milestone) }
+      (merge escrow { 
+        released-amount: (+ (get released-amount escrow) payment-amount),
+        is-completed: (>= (+ (get released-amount escrow) payment-amount) (get total-amount escrow))
+      })
+    )
+    
+    (map-set artists
+      { artist-id: (get artist-id escrow) }
+      (merge artist { total-earned: (+ (get total-earned artist) artist-payment) })
+    )
+    
+    (ok artist-payment)
+  )
+)
+
+(define-public (refund-escrow (escrow-id uint))
+  (let
+    (
+      (escrow (unwrap! (get-escrow escrow-id) err-escrow-not-found))
+      (current-block stacks-block-height)
+      (refund-amount (- (get total-amount escrow) (get released-amount escrow)))
+    )
+    (asserts! (is-eq tx-sender (get client escrow)) err-unauthorized)
+    (asserts! (>= current-block (get expiry-block escrow)) err-invalid-amount)
+    (asserts! (not (get is-completed escrow)) err-escrow-completed)
+    (asserts! (> refund-amount u0) err-invalid-amount)
+    
+    (try! (as-contract (stx-transfer? refund-amount tx-sender (get client escrow))))
+    
+    (map-set escrows
+      { escrow-id: escrow-id }
+      (merge escrow { is-completed: true })
+    )
+    
+    (ok refund-amount)
   )
 )
 
