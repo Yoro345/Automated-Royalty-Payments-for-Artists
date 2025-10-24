@@ -15,6 +15,11 @@
 (define-constant err-escrow-expired (err u113))
 (define-constant err-escrow-completed (err u114))
 (define-constant err-milestone-already-completed (err u115))
+(define-constant err-collaboration-not-found (err u116))
+(define-constant err-collaboration-exists (err u117))
+(define-constant err-invalid-split (err u118))
+(define-constant err-not-collaborator (err u119))
+(define-constant err-collaboration-locked (err u120))
 
 (define-data-var next-artist-id uint u1)
 (define-data-var next-payment-id uint u1)
@@ -22,6 +27,7 @@
 (define-data-var next-advance-id uint u1)
 (define-data-var next-escrow-id uint u1)
 (define-data-var next-milestone-id uint u1)
+(define-data-var next-collaboration-id uint u1)
 
 (define-map artists
   { artist-id: uint }
@@ -108,6 +114,41 @@
     submission-block: uint,
     approval-block: uint
   }
+)
+
+(define-map collaborations
+  { collaboration-id: uint }
+  {
+    name: (string-ascii 100),
+    creator: principal,
+    total-splits: uint,
+    is-locked: bool,
+    is-active: bool,
+    created-at: uint
+  }
+)
+
+(define-map collaboration-splits
+  { collaboration-id: uint, artist-id: uint }
+  {
+    split-percentage: uint,
+    is-approved: bool,
+    approved-at: uint
+  }
+)
+
+(define-map collaboration-revenue
+  { collaboration-id: uint }
+  {
+    total-collected: uint,
+    total-distributed: uint,
+    last-distribution: uint
+  }
+)
+
+(define-map artist-collaborations
+  { artist-id: uint, collaboration-id: uint }
+  { is-member: bool }
 )
 
 (define-data-var next-stream-id uint u1)
@@ -696,6 +737,311 @@
     )
     
     (ok refund-amount)
+  )
+)
+
+(define-public (create-collaboration (name (string-ascii 100)))
+  (let
+    (
+      (collaboration-id (var-get next-collaboration-id))
+      (current-block stacks-block-height)
+    )
+    (map-set collaborations
+      { collaboration-id: collaboration-id }
+      {
+        name: name,
+        creator: tx-sender,
+        total-splits: u0,
+        is-locked: false,
+        is-active: true,
+        created-at: current-block
+      }
+    )
+    
+    (map-set collaboration-revenue
+      { collaboration-id: collaboration-id }
+      {
+        total-collected: u0,
+        total-distributed: u0,
+        last-distribution: u0
+      }
+    )
+    
+    (var-set next-collaboration-id (+ collaboration-id u1))
+    (ok collaboration-id)
+  )
+)
+
+(define-public (add-collaborator (collaboration-id uint) (artist-id uint) (split-percentage uint))
+  (let
+    (
+      (collab (unwrap! (map-get? collaborations { collaboration-id: collaboration-id }) err-collaboration-not-found))
+      (artist (unwrap! (get-artist artist-id) err-not-found))
+      (existing-split (map-get? collaboration-splits { collaboration-id: collaboration-id, artist-id: artist-id }))
+      (current-splits (get total-splits collab))
+      (new-total-splits (+ current-splits split-percentage))
+    )
+    (asserts! (is-eq tx-sender (get creator collab)) err-unauthorized)
+    (asserts! (not (get is-locked collab)) err-collaboration-locked)
+    (asserts! (get is-active collab) err-not-found)
+    (asserts! (get is-active artist) err-not-found)
+    (asserts! (is-none existing-split) err-collaboration-exists)
+    (asserts! (<= new-total-splits u10000) err-invalid-split)
+    (asserts! (> split-percentage u0) err-invalid-percentage)
+    
+    (map-set collaboration-splits
+      { collaboration-id: collaboration-id, artist-id: artist-id }
+      {
+        split-percentage: split-percentage,
+        is-approved: false,
+        approved-at: u0
+      }
+    )
+    
+    (map-set artist-collaborations
+      { artist-id: artist-id, collaboration-id: collaboration-id }
+      { is-member: true }
+    )
+    
+    (map-set collaborations
+      { collaboration-id: collaboration-id }
+      (merge collab { total-splits: new-total-splits })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (approve-collaboration-split (collaboration-id uint))
+  (let
+    (
+      (artist-lookup (unwrap! (map-get? artist-by-principal { owner: tx-sender }) err-not-found))
+      (artist-id (get artist-id artist-lookup))
+      (split (unwrap! (map-get? collaboration-splits { collaboration-id: collaboration-id, artist-id: artist-id }) err-not-collaborator))
+      (collab (unwrap! (map-get? collaborations { collaboration-id: collaboration-id }) err-collaboration-not-found))
+      (current-block stacks-block-height)
+    )
+    (asserts! (not (get is-approved split)) err-collaboration-exists)
+    (asserts! (not (get is-locked collab)) err-collaboration-locked)
+    (asserts! (get is-active collab) err-not-found)
+    
+    (map-set collaboration-splits
+      { collaboration-id: collaboration-id, artist-id: artist-id }
+      (merge split { is-approved: true, approved-at: current-block })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (lock-collaboration (collaboration-id uint))
+  (let
+    (
+      (collab (unwrap! (map-get? collaborations { collaboration-id: collaboration-id }) err-collaboration-not-found))
+    )
+    (asserts! (is-eq tx-sender (get creator collab)) err-unauthorized)
+    (asserts! (not (get is-locked collab)) err-collaboration-locked)
+    (asserts! (is-eq (get total-splits collab) u10000) err-invalid-split)
+    
+    (map-set collaborations
+      { collaboration-id: collaboration-id }
+      (merge collab { is-locked: true })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (add-collaboration-revenue (collaboration-id uint) (amount uint))
+  (let
+    (
+      (collab (unwrap! (map-get? collaborations { collaboration-id: collaboration-id }) err-collaboration-not-found))
+      (revenue (unwrap! (map-get? collaboration-revenue { collaboration-id: collaboration-id }) err-not-found))
+    )
+    (asserts! (get is-locked collab) err-collaboration-locked)
+    (asserts! (get is-active collab) err-not-found)
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (>= (stx-get-balance tx-sender) amount) err-insufficient-funds)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set collaboration-revenue
+      { collaboration-id: collaboration-id }
+      (merge revenue { total-collected: (+ (get total-collected revenue) amount) })
+    )
+    
+    (ok amount)
+  )
+)
+
+(define-public (distribute-collaboration-payment (collaboration-id uint) (artist-id uint))
+  (let
+    (
+      (collab (unwrap! (map-get? collaborations { collaboration-id: collaboration-id }) err-collaboration-not-found))
+      (artist (unwrap! (get-artist artist-id) err-not-found))
+      (split (unwrap! (map-get? collaboration-splits { collaboration-id: collaboration-id, artist-id: artist-id }) err-not-collaborator))
+      (revenue (unwrap! (map-get? collaboration-revenue { collaboration-id: collaboration-id }) err-not-found))
+      (undistributed (- (get total-collected revenue) (get total-distributed revenue)))
+      (artist-share (/ (* undistributed (get split-percentage split)) u10000))
+      (contract-fee (/ (* artist-share (var-get contract-fee-percentage)) u10000))
+      (final-payment (- artist-share contract-fee))
+      (current-block stacks-block-height)
+    )
+    (asserts! (get is-locked collab) err-collaboration-locked)
+    (asserts! (get is-active collab) err-not-found)
+    (asserts! (get is-approved split) err-not-collaborator)
+    (asserts! (get is-active artist) err-not-found)
+    (asserts! (> final-payment u0) err-invalid-amount)
+    (asserts! (> undistributed u0) err-invalid-amount)
+    
+    (try! (as-contract (stx-transfer? final-payment tx-sender (get owner artist))))
+    
+    (map-set collaboration-revenue
+      { collaboration-id: collaboration-id }
+      (merge revenue { 
+        total-distributed: (+ (get total-distributed revenue) artist-share),
+        last-distribution: current-block
+      })
+    )
+    
+    (map-set artists
+      { artist-id: artist-id }
+      (merge artist { total-earned: (+ (get total-earned artist) final-payment) })
+    )
+    
+    (ok final-payment)
+  )
+)
+
+(define-public (distribute-all-collaboration-payments (collaboration-id uint) (artist-ids (list 10 uint)))
+  (let
+    (
+      (collab (unwrap! (map-get? collaborations { collaboration-id: collaboration-id }) err-collaboration-not-found))
+      (revenue (unwrap! (map-get? collaboration-revenue { collaboration-id: collaboration-id }) err-not-found))
+      (undistributed (- (get total-collected revenue) (get total-distributed revenue)))
+      (current-block stacks-block-height)
+      (final-state (fold process-collab-payment artist-ids { collaboration-id: collaboration-id, total-paid: u0, undistributed: undistributed, current-block: current-block }))
+      (total-distributed (get total-paid final-state))
+    )
+    (asserts! (get is-locked collab) err-collaboration-locked)
+    (asserts! (get is-active collab) err-not-found)
+    (asserts! (> undistributed u0) err-invalid-amount)
+    
+    (map-set collaboration-revenue
+      { collaboration-id: collaboration-id }
+      (merge revenue { 
+        total-distributed: (+ (get total-distributed revenue) total-distributed),
+        last-distribution: current-block
+      })
+    )
+    
+    (ok total-distributed)
+  )
+)
+
+(define-private (process-collab-payment (artist-id uint) (state { collaboration-id: uint, total-paid: uint, undistributed: uint, current-block: uint }))
+  (let
+    (
+      (collaboration-id (get collaboration-id state))
+      (artist-result (get-artist artist-id))
+      (split-result (map-get? collaboration-splits { collaboration-id: collaboration-id, artist-id: artist-id }))
+    )
+    (match artist-result
+      artist
+      (match split-result
+        split
+        (if (and (get is-approved split) (get is-active artist))
+          (let
+            (
+              (artist-share (/ (* (get undistributed state) (get split-percentage split)) u10000))
+              (contract-fee (/ (* artist-share (var-get contract-fee-percentage)) u10000))
+              (final-payment (- artist-share contract-fee))
+            )
+            (if (> final-payment u0)
+              (match (as-contract (stx-transfer? final-payment tx-sender (get owner artist)))
+                success
+                (begin
+                  (map-set artists
+                    { artist-id: artist-id }
+                    (merge artist { total-earned: (+ (get total-earned artist) final-payment) })
+                  )
+                  (merge state { total-paid: (+ (get total-paid state) artist-share) })
+                )
+                error state
+              )
+              state
+            )
+          )
+          state
+        )
+        state
+      )
+      state
+    )
+  )
+)
+
+(define-public (update-collaboration-status (collaboration-id uint) (is-active bool))
+  (let
+    (
+      (collab (unwrap! (map-get? collaborations { collaboration-id: collaboration-id }) err-collaboration-not-found))
+    )
+    (asserts! (is-eq tx-sender (get creator collab)) err-unauthorized)
+    
+    (map-set collaborations
+      { collaboration-id: collaboration-id }
+      (merge collab { is-active: is-active })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-collaboration (collaboration-id uint))
+  (map-get? collaborations { collaboration-id: collaboration-id })
+)
+
+(define-read-only (get-collaboration-split (collaboration-id uint) (artist-id uint))
+  (map-get? collaboration-splits { collaboration-id: collaboration-id, artist-id: artist-id })
+)
+
+(define-read-only (get-collaboration-revenue (collaboration-id uint))
+  (map-get? collaboration-revenue { collaboration-id: collaboration-id })
+)
+
+(define-read-only (is-collaboration-member (artist-id uint) (collaboration-id uint))
+  (match (map-get? artist-collaborations { artist-id: artist-id, collaboration-id: collaboration-id })
+    entry (get is-member entry)
+    false
+  )
+)
+
+(define-read-only (get-next-collaboration-id)
+  (var-get next-collaboration-id)
+)
+
+(define-read-only (calculate-collaboration-share (collaboration-id uint) (artist-id uint))
+  (match (map-get? collaboration-revenue { collaboration-id: collaboration-id })
+    revenue
+    (match (map-get? collaboration-splits { collaboration-id: collaboration-id, artist-id: artist-id })
+      split
+      (let
+        (
+          (undistributed (- (get total-collected revenue) (get total-distributed revenue)))
+          (artist-share (/ (* undistributed (get split-percentage split)) u10000))
+          (contract-fee (/ (* artist-share (var-get contract-fee-percentage)) u10000))
+          (final-payment (- artist-share contract-fee))
+        )
+        (ok {
+          gross-share: artist-share,
+          contract-fee: contract-fee,
+          net-payment: final-payment,
+          split-percentage: (get split-percentage split)
+        })
+      )
+      err-not-collaborator
+    )
+    err-collaboration-not-found
   )
 )
 
