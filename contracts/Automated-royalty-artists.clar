@@ -28,6 +28,7 @@
 (define-data-var next-escrow-id uint u1)
 (define-data-var next-milestone-id uint u1)
 (define-data-var next-collaboration-id uint u1)
+(define-data-var next-tip-id uint u1)
 
 (define-map artists
   { artist-id: uint }
@@ -149,6 +150,17 @@
 (define-map artist-collaborations
   { artist-id: uint, collaboration-id: uint }
   { is-member: bool }
+)
+
+(define-map tips
+  { tip-id: uint }
+  {
+    artist-id: uint,
+    sender: principal,
+    amount: uint,
+    message: (string-ascii 200),
+    timestamp: uint
+  }
 )
 
 (define-data-var next-stream-id uint u1)
@@ -1042,6 +1054,43 @@
       err-not-collaborator
     )
     err-collaboration-not-found
+  )
+)
+
+(define-read-only (get-tip (tip-id uint))
+  (map-get? tips { tip-id: tip-id })
+)
+
+(define-public (tip-artist (artist-id uint) (amount uint) (message (string-ascii 200)))
+  (let
+    (
+      (artist (unwrap! (get-artist artist-id) err-not-found))
+      (tip-id (var-get next-tip-id))
+      (current-block stacks-block-height)
+    )
+    (asserts! (get is-active artist) err-not-found)
+    (asserts! (> amount u0) err-invalid-amount)
+    
+    (try! (stx-transfer? amount tx-sender (get owner artist)))
+    
+    (map-set tips
+      { tip-id: tip-id }
+      {
+        artist-id: artist-id,
+        sender: tx-sender,
+        amount: amount,
+        message: message,
+        timestamp: current-block
+      }
+    )
+    
+    (map-set artists
+      { artist-id: artist-id }
+      (merge artist { total-earned: (+ (get total-earned artist) amount) })
+    )
+    
+    (var-set next-tip-id (+ tip-id u1))
+    (ok tip-id)
   )
 )
 
